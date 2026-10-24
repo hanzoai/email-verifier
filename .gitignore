@@ -2,3 +2,4 @@
 .vscode/
 vendor/
 covprofile
+bin/

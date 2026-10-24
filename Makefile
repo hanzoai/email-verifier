@@ -4,7 +4,11 @@ CCCOLOR="\033[37;1m"
 MAKECOLOR="\033[32;1m"
 ENDCOLOR="\033[0m"
 
-.PHONY: all
+.PHONY: all build test detect_race lint
+
+build:
+	@mkdir -p bin
+	go build -o bin/verifier cmd/verifier/main.go
 
 test:
 	@go test -race -covermode atomic -coverprofile=covprofile ./...
