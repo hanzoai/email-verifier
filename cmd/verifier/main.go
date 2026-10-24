@@ -9,13 +9,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	emailverifier "github.com/AfterShip/email-verifier"
+	emailverifier "github.com/hanzoai/email-verifier"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -170,7 +171,113 @@ func (bv *BatchVerifier) VerifyOne(rawEmail string) VerifyResult {
 	return res
 }
 
-func verifySQLiteDB(dbPath, blacklistPath string, concurrency, limit, batchSize int, daemon bool) {
+type APIVerifyResponse struct {
+	Email       string `json:"email"`
+	Deliverable bool   `json:"deliverable"`
+	Status      string `json:"status"`
+	Reason      string `json:"reason"`
+	Domain      string `json:"domain"`
+	HasMX       bool   `json:"has_mx"`
+	Disposable  bool   `json:"disposable"`
+	Role        bool   `json:"role"`
+	Free        bool   `json:"free"`
+	Suggestion  string `json:"suggestion,omitempty"`
+}
+
+func startAPIServer(bv *BatchVerifier, port int) {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/v1/email/verify", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		var emails []string
+
+		if r.Method == http.MethodGet {
+			em := r.URL.Query().Get("email")
+			if em != "" {
+				emails = append(emails, em)
+			}
+		} else if r.Method == http.MethodPost {
+			var body struct {
+				Email  string   `json:"email"`
+				Emails []string `json:"emails"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+				if body.Email != "" {
+					emails = append(emails, body.Email)
+				}
+				if len(body.Emails) > 0 {
+					emails = append(emails, body.Emails...)
+				}
+			}
+		}
+
+		if len(emails) == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "missing 'email' query param or JSON body"})
+			return
+		}
+
+		if len(emails) == 1 {
+			res := bv.VerifyOne(emails[0])
+			resp := APIVerifyResponse{
+				Email:       res.Email,
+				Deliverable: res.Status == StatusClean,
+				Status:      string(res.Status),
+				Reason:      res.Reason,
+				Domain:      res.Domain,
+				HasMX:       res.HasMX,
+				Disposable:  res.Disposable,
+				Role:        res.Role,
+				Free:        res.Free,
+				Suggestion:  res.Suggestion,
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		var results []APIVerifyResponse
+		for _, em := range emails {
+			res := bv.VerifyOne(em)
+			results = append(results, APIVerifyResponse{
+				Email:       res.Email,
+				Deliverable: res.Status == StatusClean,
+				Status:      string(res.Status),
+				Reason:      res.Reason,
+				Domain:      res.Domain,
+				HasMX:       res.HasMX,
+				Disposable:  res.Disposable,
+				Role:        res.Role,
+				Free:        res.Free,
+				Suggestion:  res.Suggestion,
+			})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"data": results, "count": len(results)})
+	})
+
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":       "ok",
+			"suppressions": len(bv.blacklist),
+			"service":      "hanzo-email-verifier",
+		})
+	})
+
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	fmt.Printf("🚀 Email Verifier API microservice listening on http://%s/v1/email/verify\n", addr)
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("API server error: %v", err)
+	}
+}
+
+func verifySQLiteDB(dbPath, blacklistPath string, concurrency, limit, batchSize int, daemon bool, serverPort int) {
 	fmt.Printf("=== Starting High-Performance Email Verification on SQLite DB ===\n")
 	fmt.Printf("Database: %s\n", dbPath)
 
@@ -216,6 +323,10 @@ func verifySQLiteDB(dbPath, blacklistPath string, concurrency, limit, batchSize 
 	bv, err := NewBatchVerifier(blacklistPath, concurrency)
 	if err != nil {
 		log.Fatalf("Failed to initialize batch verifier: %v", err)
+	}
+
+	if daemon && serverPort > 0 {
+		go startAPIServer(bv, serverPort)
 	}
 
 	// Count already verified
@@ -652,7 +763,19 @@ func main() {
 	statsOnly := flag.Bool("stats", false, "Print verification stats from DB and exit")
 	daemon := flag.Bool("daemon", false, "Run continuously in background, verifying new leads as they arrive")
 	singleEmail := flag.String("email", "", "Verify a single email and print JSON result")
+	serverMode := flag.Bool("server", false, "Run standalone HTTP microservice serving /v1/email/verify")
+	serverPort := flag.Int("port", 8085, "HTTP server port for /v1/email/verify (default 8085)")
 	flag.Parse()
+
+	// 0. Standalone Server mode
+	if *serverMode {
+		bv, err := NewBatchVerifier(*blacklistPath, *concurrency)
+		if err != nil {
+			log.Fatalf("Error: %v", err)
+		}
+		startAPIServer(bv, *serverPort)
+		return
+	}
 
 	// 1. Single email mode
 	if *singleEmail != "" {
@@ -684,5 +807,5 @@ func main() {
 	}
 
 	// 4. SQLite DB Mode
-	verifySQLiteDB(*dbPath, *blacklistPath, *concurrency, *limit, *batchSize, *daemon)
+	verifySQLiteDB(*dbPath, *blacklistPath, *concurrency, *limit, *batchSize, *daemon, *serverPort)
 }

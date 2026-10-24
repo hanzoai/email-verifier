@@ -1,4 +1,4 @@
-module github.com/AfterShip/email-verifier
+module github.com/hanzoai/email-verifier
 
 go 1.25.0
 
