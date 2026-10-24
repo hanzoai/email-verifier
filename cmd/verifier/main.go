@@ -179,6 +179,7 @@ func verifySQLiteDB(dbPath, blacklistPath string, concurrency, limit, batchSize 
 		log.Fatalf("Failed to open SQLite DB: %v", err)
 	}
 	defer db.Close()
+	db.SetMaxOpenConns(1)
 
 	// Ensure target verification table exists
 	_, err = db.Exec(`
@@ -244,7 +245,7 @@ func verifySQLiteDB(dbPath, blacklistPath string, concurrency, limit, batchSize 
 			}
 		}
 
-		rows, err := db.Query("SELECT l.email FROM leads l WHERE l.email NOT IN (SELECT email FROM email_verifications) LIMIT ?", curLimit)
+		rows, err := db.Query("SELECT l.email FROM leads l LEFT JOIN email_verifications v ON l.email = v.email WHERE v.email IS NULL LIMIT ?", curLimit)
 		if err != nil {
 			log.Fatalf("Query error: %v", err)
 		}
