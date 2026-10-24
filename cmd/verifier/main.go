@@ -384,7 +384,7 @@ func verifySQLiteDB(dbPath, blacklistPath string, concurrency, limit, batchSize 
 	printStats(db)
 }
 
-func verifyCSV(csvIn, csvOut, blacklistPath string, concurrency int) {
+func verifyCSV(csvIn, csvOut, cleanOut, badOut, blacklistPath, dbPath string, concurrency int, recordDB bool) {
 	fmt.Printf("=== Verifying CSV: %s ===\n", csvIn)
 	f, err := os.Open(csvIn)
 	if err != nil {
@@ -484,6 +484,7 @@ func verifyCSV(csvIn, csvOut, blacklistPath string, concurrency int) {
 	close(results)
 	<-doneCollector
 
+	// Annotated output CSV
 	if csvOut != "" {
 		outFile, err := os.Create(csvOut)
 		if err != nil {
@@ -514,6 +515,94 @@ func verifyCSV(csvIn, csvOut, blacklistPath string, concurrency int) {
 		}
 		writer.Flush()
 		fmt.Printf("✅ Wrote %d verified results to %s\n", total, csvOut)
+	}
+
+	// Clean-only CSV
+	if cleanOut != "" {
+		cleanFile, err := os.Create(cleanOut)
+		if err != nil {
+			log.Fatalf("Failed to create clean CSV: %v", err)
+		}
+		defer cleanFile.Close()
+		cleanWriter := csv.NewWriter(cleanFile)
+		_ = cleanWriter.Write(header)
+		cleanCount := 0
+		for i, r := range rows {
+			if verifiedResults[i].Status == StatusClean {
+				_ = cleanWriter.Write(r)
+				cleanCount++
+			}
+		}
+		cleanWriter.Flush()
+		fmt.Printf("✅ Wrote %d 100%% clean deliverable rows to %s\n", cleanCount, cleanOut)
+	}
+
+	// Bad-only CSV (archive)
+	if badOut != "" {
+		badFile, err := os.Create(badOut)
+		if err != nil {
+			log.Fatalf("Failed to create bad CSV: %v", err)
+		}
+		defer badFile.Close()
+		badWriter := csv.NewWriter(badFile)
+		badHeader := append(header, "verification_status", "verification_reason")
+		_ = badWriter.Write(badHeader)
+		badCount := 0
+		for i, r := range rows {
+			if verifiedResults[i].Status != StatusClean {
+				outRow := append(r, string(verifiedResults[i].Status), verifiedResults[i].Reason)
+				_ = badWriter.Write(outRow)
+				badCount++
+			}
+		}
+		badWriter.Flush()
+		fmt.Printf("⚠️  Wrote %d bad/bounced rows to archive: %s\n", badCount, badOut)
+	}
+
+	// Record into SQLite DB
+	if recordDB && dbPath != "" {
+		db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=10000")
+		if err != nil {
+			log.Printf("Warning: failed to open SQLite DB to record results: %v", err)
+		} else {
+			defer db.Close()
+			db.SetMaxOpenConns(1)
+			tx, err := db.Begin()
+			if err == nil {
+				stmt, err := tx.Prepare(`
+					INSERT OR REPLACE INTO email_verifications 
+					(email, status, reason, domain, has_mx, is_disposable, is_role, is_free, suggestion) 
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+				`)
+				if err == nil {
+					for _, r := range verifiedResults {
+						if r.Email == "" {
+							continue
+						}
+						hasMxInt := 0
+						if r.HasMX {
+							hasMxInt = 1
+						}
+						dispInt := 0
+						if r.Disposable {
+							dispInt = 1
+						}
+						roleInt := 0
+						if r.Role {
+							roleInt = 1
+						}
+						freeInt := 0
+						if r.Free {
+							freeInt = 1
+						}
+						_, _ = stmt.Exec(r.Email, string(r.Status), r.Reason, r.Domain, hasMxInt, dispInt, roleInt, freeInt, r.Suggestion)
+					}
+					_ = stmt.Close()
+					_ = tx.Commit()
+					fmt.Printf("📦 Recorded %d verification results into %s\n", len(verifiedResults), dbPath)
+				}
+			}
+		}
 	}
 
 	fmt.Printf("\n--- Verification Summary for %s ---\n", csvIn)
@@ -553,7 +642,10 @@ func main() {
 	dbPath := flag.String("db", "/Users/a/Downloads/scale_1m_batches/leads_master.db", "SQLite database path")
 	blacklistPath := flag.String("blacklist", "/Users/a/Downloads/segmented_campaign_lists/complaints_blacklist.json", "Blacklist JSON or text file")
 	csvIn := flag.String("csv", "", "Path to CSV file to verify")
-	csvOut := flag.String("out", "", "Path to output verified CSV")
+	csvOut := flag.String("out", "", "Path to output verified CSV (annotated)")
+	cleanOut := flag.String("clean-out", "", "Path to output clean-only CSV (drops bad/bounces)")
+	badOut := flag.String("bad-out", "", "Path to output bad-only CSV (archive)")
+	recordDB := flag.Bool("record-db", false, "Record verified emails into SQLite DB")
 	concurrency := flag.Int("concurrency", 64, "Number of concurrent verification workers")
 	limit := flag.Int("limit", 0, "Max number of emails to verify from DB (0 for all)")
 	batchSize := flag.Int("batch", 2000, "SQLite insert batch transaction size")
@@ -587,7 +679,7 @@ func main() {
 
 	// 3. CSV Mode
 	if *csvIn != "" {
-		verifyCSV(*csvIn, *csvOut, *blacklistPath, *concurrency)
+		verifyCSV(*csvIn, *csvOut, *cleanOut, *badOut, *blacklistPath, *dbPath, *concurrency, *recordDB)
 		return
 	}
 
