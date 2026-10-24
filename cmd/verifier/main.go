@@ -170,7 +170,7 @@ func (bv *BatchVerifier) VerifyOne(rawEmail string) VerifyResult {
 	return res
 }
 
-func verifySQLiteDB(dbPath, blacklistPath string, concurrency, limit, batchSize int) {
+func verifySQLiteDB(dbPath, blacklistPath string, concurrency, limit, batchSize int, daemon bool) {
 	fmt.Printf("=== Starting High-Performance Email Verification on SQLite DB ===\n")
 	fmt.Printf("Database: %s\n", dbPath)
 
@@ -195,9 +195,21 @@ func verifySQLiteDB(dbPath, blacklistPath string, concurrency, limit, batchSize 
 			verified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);
 		CREATE INDEX IF NOT EXISTS idx_verif_status ON email_verifications(status);
+
+		CREATE VIEW IF NOT EXISTS v_clean_leads AS 
+		SELECT l.* 
+		FROM leads l 
+		INNER JOIN email_verifications v ON l.email = v.email 
+		WHERE v.status = 'clean';
+
+		CREATE VIEW IF NOT EXISTS v_bad_leads AS 
+		SELECT l.*, v.status as verification_status, v.reason as verification_reason
+		FROM leads l 
+		INNER JOIN email_verifications v ON l.email = v.email 
+		WHERE v.status != 'clean';
 	`)
 	if err != nil {
-		log.Fatalf("Failed to create verification table: %v", err)
+		log.Fatalf("Failed to create verification table/views: %v", err)
 	}
 
 	bv, err := NewBatchVerifier(blacklistPath, concurrency)
@@ -247,6 +259,11 @@ func verifySQLiteDB(dbPath, blacklistPath string, concurrency, limit, batchSize 
 		rows.Close()
 
 		if len(emailList) == 0 {
+			if daemon {
+				fmt.Printf("[%s] No unverified leads in database. Sleeping 10s for incoming harvester leads...\n", time.Now().Format("15:04:05"))
+				time.Sleep(10 * time.Second)
+				continue
+			}
 			fmt.Println("All leads in database are verified!")
 			break
 		}
@@ -540,6 +557,7 @@ func main() {
 	limit := flag.Int("limit", 0, "Max number of emails to verify from DB (0 for all)")
 	batchSize := flag.Int("batch", 2000, "SQLite insert batch transaction size")
 	statsOnly := flag.Bool("stats", false, "Print verification stats from DB and exit")
+	daemon := flag.Bool("daemon", false, "Run continuously in background, verifying new leads as they arrive")
 	singleEmail := flag.String("email", "", "Verify a single email and print JSON result")
 	flag.Parse()
 
@@ -573,5 +591,5 @@ func main() {
 	}
 
 	// 4. SQLite DB Mode
-	verifySQLiteDB(*dbPath, *blacklistPath, *concurrency, *limit, *batchSize)
+	verifySQLiteDB(*dbPath, *blacklistPath, *concurrency, *limit, *batchSize, *daemon)
 }
